@@ -9,7 +9,6 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
-using System.Threading.Tasks;
 using System.Collections.Generic;
 
 namespace LiveSplit.BunnySplit
@@ -64,7 +63,7 @@ namespace LiveSplit.BunnySplit
             ".",
             PIPE_NAME,
             PipeAccessRights.ReadData | PipeAccessRights.WriteAttributes,
-            PipeOptions.None,
+            PipeOptions.Asynchronous,
             System.Security.Principal.TokenImpersonationLevel.None,
             System.IO.HandleInheritability.None);
         private CancellationTokenSource cts = new CancellationTokenSource();
@@ -90,6 +89,7 @@ namespace LiveSplit.BunnySplit
 
         public override void Dispose()
         {
+            model.CurrentState.OnStart -= OnStart;
             cts.Cancel();
             pipeThread.Join();
         }
@@ -314,42 +314,28 @@ namespace LiveSplit.BunnySplit
                 try
                 {
                     var buf = new byte[256];
-                    var task = pipe.ReadAsync(buf, 0, 256, cts.Token);
-                    task.Wait();
+                    var result = pipe.BeginRead(buf, 0, 256, null, null);
 
-                    if (task.Result == 0)
+                    // BXT only writes while its timer runs, so also wait for Dispose().
+                    // Closing the pipe cancels the read; EndRead below still runs to free it.
+                    if (WaitHandle.WaitAny(new[] { result.AsyncWaitHandle, cts.Token.WaitHandle }) == 1)
+                        pipe.Dispose();
+
+                    var read = pipe.EndRead(result);
+                    if (read == 0)
                     {
                         // The pipe was closed.
                         Debug.WriteLine("Pipe end of stream reached.");
                         continue;
                     }
 
-                    if (buf[0] != task.Result)
+                    if (buf[0] != read)
                     {
-                        Debug.WriteLine("Received an incorrect number of bytes (" + task.Result + ", expected " + buf[0] + ").");
+                        Debug.WriteLine("Received an incorrect number of bytes (" + read + ", expected " + buf[0] + ").");
                         continue;
                     }
 
                     ParseMessage(buf);
-                }
-                catch (AggregateException e)
-                {
-                    foreach (var ex in e.InnerExceptions)
-                    {
-                        if (ex is TaskCanceledException)
-                        {
-                            return;
-                        }
-                    }
-
-                    Debug.WriteLine("Error reading from the pipe:");
-                    foreach (var ex in e.InnerExceptions)
-                    {
-                        Debug.WriteLine("- " + ex.GetType().Name + ": " + ex.Message);
-                    }
-                    Debug.WriteLine("Idling for 1 second.");
-                    cts.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(1));
-                    continue;
                 }
                 catch (Exception e)
                 {
@@ -359,6 +345,9 @@ namespace LiveSplit.BunnySplit
                     continue;
                 }
             }
+
+            // Closing the pipe frees BXT's only pipe instance for the next component.
+            pipe.Dispose();
         }
     }
 }
